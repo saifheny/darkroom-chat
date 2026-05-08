@@ -1,0 +1,149 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 0. Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- PRIMITIVES & HELPERS ---
+    function isSignedIn() {
+      return request.auth != null && request.auth.token.firebase.sign_in_provider == 'anonymous';
+    }
+    
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // --- VALIDATION BLUEPRINTS ---
+    function isValidUser(data) {
+      return data.size() == 5
+        && data.keys().hasAll(['userId', 'displayName', 'photoData', 'createdAt', 'updatedAt'])
+        && data.userId is string && data.userId.size() <= 128 && data.userId == request.auth.uid
+        && data.displayName is string && data.displayName.size() <= 100
+        && data.photoData is string && data.photoData.size() <= 1000000 // up to 1MB base64
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidRoom(data) {
+      return data.size() == 4
+        && data.keys().hasAll(['creatorId', 'name', 'linkExpiresAt', 'createdAt'])
+        && data.creatorId is string && data.creatorId == request.auth.uid
+        && data.name is string && data.name.size() > 0 && data.name.size() <= 100
+        && data.linkExpiresAt is timestamp
+        && data.createdAt is timestamp;
+    }
+
+    function isValidMember(data) {
+      return data.size() == 2
+        && data.keys().hasAll(['userId', 'joinedAt'])
+        && data.userId is string && data.userId == request.auth.uid
+        && data.joinedAt is timestamp;
+    }
+
+    function isValidMessage(data) {
+      return (data.size() == 4 || data.size() == 5)
+        && data.keys().hasAll(['senderId', 'text', 'type', 'createdAt'])
+        && data.senderId is string && data.senderId == request.auth.uid
+        && data.text is string && data.text.size() <= 50000 
+        && data.type is string && data.type in ['text', 'image', 'audio', 'video', 'system', 'ai']
+        && (data.get('mediaData', '') is string && data.get('mediaData', '').size() <= 1000000)
+        && data.createdAt is timestamp;
+    }
+
+    // --- RULES ---
+
+    match /users/{userId} {
+      allow get: if isSignedIn() && isValidId(userId);
+      allow list: if isSignedIn(); // allow all to read users to display names/photos
+      allow create: if isSignedIn() 
+        && isValidId(userId)
+        && userId == request.auth.uid
+        && isValidUser(incoming())
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isSignedIn()
+        && isValidId(userId)
+        && userId == request.auth.uid
+        && isValidUser(incoming())
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'photoData', 'updatedAt']);
+    }
+
+    match /rooms/{roomId} {
+      allow get: if isSignedIn() && isValidId(roomId);
+      allow list: if false;
+
+      allow create: if isSignedIn()
+        && isValidId(roomId)
+        && isValidRoom(incoming())
+        && incoming().createdAt == request.time;
+      
+      allow update: if isSignedIn()
+        && isValidId(roomId)
+        && existing().creatorId == request.auth.uid
+        && incoming().creatorId == request.auth.uid
+        && incoming().createdAt == existing().createdAt
+        && isValidRoom(incoming())
+        && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'linkExpiresAt']);
+      
+      allow delete: if isSignedIn()
+        && isValidId(roomId)
+        && existing().creatorId == request.auth.uid;
+
+      match /members/{memberId} {
+        allow list, get: if isSignedIn() 
+          && isValidId(roomId) && isValidId(memberId)
+          && exists(/databases/$(database)/documents/rooms/$(roomId)/members/$(request.auth.uid));
+
+        allow create: if isSignedIn()
+          && isValidId(roomId) && isValidId(memberId)
+          && memberId == request.auth.uid
+          && isValidMember(incoming())
+          && (
+            get(/databases/$(database)/documents/rooms/$(roomId)).data.creatorId == request.auth.uid
+            || get(/databases/$(database)/documents/rooms/$(roomId)).data.linkExpiresAt > request.time
+          )
+          && incoming().joinedAt == request.time;
+        
+        allow update: if false;
+
+        allow delete: if isSignedIn()
+          && isValidId(roomId) && isValidId(memberId)
+          && (
+            memberId == request.auth.uid 
+            || get(/databases/$(database)/documents/rooms/$(roomId)).data.creatorId == request.auth.uid
+          );
+      }
+
+      match /messages/{messageId} {
+        allow list, get: if isSignedIn()
+          && isValidId(roomId) && isValidId(messageId)
+          && exists(/databases/$(database)/documents/rooms/$(roomId)/members/$(request.auth.uid));
+
+        allow create: if isSignedIn()
+          && isValidId(roomId) && isValidId(messageId)
+          && exists(/databases/$(database)/documents/rooms/$(roomId)/members/$(request.auth.uid))
+          && isValidMessage(incoming())
+          && incoming().createdAt == request.time;
+
+        allow update: if false;
+
+        allow delete: if isSignedIn()
+          && isValidId(roomId) && isValidId(messageId)
+          && get(/databases/$(database)/documents/rooms/$(roomId)).data.creatorId == request.auth.uid;
+      }
+    }
+  }
+}
